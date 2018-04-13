@@ -6,7 +6,7 @@ Type: Standards Track
 Content-Type: text/x-rst
 Created: 28-Feb-2018
 Python-Version: 3.8
-Post-History: 28-Feb-2018, 02-Mar-2018, 23-Mar-2018
+Post-History: 28-Feb-2018, 02-Mar-2018, 23-Mar-2018, 04-Apr-2018
 
 
 Abstract
@@ -35,23 +35,31 @@ Syntax and semantics
 ====================
 
 In any context where arbitrary Python expressions can be used, a **named
-expression** can appear. This can be parenthesized for clarity, and is of
-the form ``(target := expr)`` where ``expr`` is any valid Python expression,
-and ``target`` is any valid assignment target.
+expression** can appear. This is of the form ``target := expr`` where
+``expr`` is any valid Python expression, and ``target`` is any valid
+assignment target. (NOTE: See 'Open questions' below for precedence.)
 
 The value of such a named expression is the same as the incorporated
 expression, with the additional side-effect that the target is assigned
-that value.
+that value::
 
-    # Similar to the boolean 'or' but checking for None specifically
-    x = "default" if (eggs := spam().ham) is None else eggs
+    # Handle a matched regex
+    if (match := pattern.search(data)) is not None:
+        ...
 
-    # Even complex expressions can be built up piece by piece
-    y = ((eggs := spam()), (cheese := eggs.method()), cheese[eggs])
+    # A more explicit alternative to the 2-arg form of iter() invocation
+    while (value := read_next_item()) is not None:
+        ...
+
+    # Share a subexpression between a comprehension filter clause and its output
+    filtered_data = [y for x in data if (y := f(x)) is not None]
 
 
 Differences from regular assignment statements
 ----------------------------------------------
+
+Most importantly, since ``:=`` is an expression, it can be used in contexts
+where statements are illegal, including lambda functions and comprehensions.
 
 An assignment statement can assign to multiple targets::
 
@@ -72,6 +80,97 @@ Augmented assignment is not supported in expression form::
 Otherwise, the semantics of assignment are unchanged by this proposal.
 
 
+Alterations to comprehensions
+-----------------------------
+
+The current behaviour of list/set/dict comprehensions and generator
+expressions has some edge cases that would behave strangely if an assignment
+expression were to be used. Therefore the proposed semantics are changed,
+removing the current edge cases, and instead altering their behaviour *only*
+in a class scope.
+
+As of Python 3.7, the outermost iterable of any comprehension is evaluated
+in the surrounding context, and then passed as an argument to the implicit
+function that evaluates the comprehension.
+
+Under this proposal, the entire body of the comprehension is evaluated in
+its implicit function. Names not assigned to within the comprehension are
+located in the surrounding scopes, as with normal lookups. As one special
+case, a comprehension at class scope will **eagerly bind** any name which
+is already defined in the class scope.
+
+A list comprehension can be unrolled into an equivalent function. With
+Python 3.7 semantics::
+
+    numbers = [x + y for x in range(3) for y in range(4)]
+    # Is approximately equivalent to
+    def <listcomp>(iterator):
+        result = []
+        for x in iterator:
+            for y in range(4):
+                result.append(x + y)
+        return result
+    numbers = <listcomp>(iter(range(3)))
+
+Under the new semantics, this would instead be equivalent to::
+
+    def <listcomp>():
+        result = []
+        for x in range(3):
+            for y in range(4):
+                result.append(x + y)
+        return result
+    numbers = <listcomp>()
+
+When a class scope is involved, a naive transformation into a function would
+prevent name lookups (as the function would behave like a method)::
+
+    class X:
+        names = ["Fred", "Barney", "Joe"]
+        prefix = "> "
+        prefixed_names = [prefix + name for name in names]
+
+With Python 3.7 semantics, this will evaluate the outermost iterable at class
+scope, which will succeed; but it will evaluate everything else in a function::
+
+    class X:
+        names = ["Fred", "Barney", "Joe"]
+        prefix = "> "
+        def <listcomp>(iterator):
+            result = []
+            for name in iterator:
+                result.append(prefix + name)
+            return result
+        prefixed_names = <listcomp>(iter(names))
+
+The name ``prefix`` is thus searched for at global scope, ignoring the class
+name. Under the proposed semantics, this name will be eagerly bound; and the
+same early binding then handles the outermost iterable as well. The list
+comprehension is thus approximately equivalent to::
+
+    class X:
+        names = ["Fred", "Barney", "Joe"]
+        prefix = "> "
+        def <listcomp>(names=names, prefix=prefix):
+            result = []
+            for name in names:
+                result.append(prefix + name)
+            return result
+        prefixed_names = <listcomp>()
+
+With list comprehensions, this is unlikely to cause any confusion. With
+generator expressions, this has the potential to affect behaviour, as the
+eager binding means that the name could be rebound between the creation of
+the genexp and the first call to ``next()``. It is, however, more closely
+aligned to normal expectations.  The effect is ONLY seen with names that
+are looked up from class scope; global names (eg ``range()``) will still
+be late-bound as usual.
+
+One consequence of this change is that certain bugs in genexps will not
+be detected until the first call to ``next()``, where today they would be
+caught upon creation of the generator. See 'open questions' below.
+
+
 Recommended use-cases
 =====================
 
@@ -79,6 +178,11 @@ Simplifying list comprehensions
 -------------------------------
 
 These list comprehensions are all approximately equivalent::
+
+    stuff = [[y := f(x), x/y] for x in range(5)]
+
+    # There are a number of less obvious ways to spell this in current
+    # versions of Python.
 
     # Calling the function twice
     stuff = [[f(x), x/f(x)] for x in range(5)]
@@ -113,14 +217,16 @@ These list comprehensions are all approximately equivalent::
     c = {}
     stuff = [[c.update(y=f(x)) or c['y'], x/c['y']] for x in range(5)]
 
-    # Using a temporary name
-    stuff = [[y := f(x), x/y] for x in range(5)]
-
 If calling ``f(x)`` is expensive or has side effects, the clean operation of
 the list comprehension gets muddled. Using a short-duration name binding
 retains the simplicity; while the extra ``for`` loop does achieve this, it
 does so at the cost of dividing the expression visually, putting the named
 part at the end of the comprehension instead of the beginning.
+
+Similarly, a list comprehension can map and filter efficiently by capturing
+the condition::
+
+    results = [(x, y, x/y) for x in input_data if (y := f(x)) > 0]
 
 
 Capturing condition values
@@ -129,18 +235,7 @@ Capturing condition values
 Assignment expressions can be used to good effect in the header of
 an ``if`` or ``while`` statement::
 
-    # Current Python, not caring about function return value
-    while input("> ") != "quit":
-        print("You entered a command.")
-
-    # Current Python, capturing return value - four-line loop header
-    while True:
-        command = input("> ");
-	if command == "quit":
-	    break
-        print("You entered:", command)
-
-    # Proposed alternative to the above
+    # Proposed syntax
     while (command := input("> ")) != "quit":
         print("You entered:", command)
 
@@ -153,6 +248,18 @@ an ``if`` or ``while`` statement::
     # Reading socket data until an empty string is returned
     while data := sock.read():
         print("Received data:", data)
+
+    # Equivalent in current Python, not caring about function return value
+    while input("> ") != "quit":
+        print("You entered a command.")
+
+    # To capture the return value in current Python demands a four-line
+    # loop header.
+    while True:
+        command = input("> ");
+        if command == "quit":
+            break
+        print("You entered:", command)
 
 Particularly with the ``while`` loop, this can remove the need to have an
 infinite loop, an assignment, and a condition. It also creates a smooth
@@ -281,6 +388,164 @@ in a statement; alternatively, a new keyword is needed, with all the costs
 therein.
 
 
+Migration path
+==============
+
+The semantic changes to list/set/dict comprehensions, and more so to generator
+expressions, may potentially require migration of code. In many cases, the
+changes simply make legal what used to raise an exception, but there are some
+edge cases that were previously legal and now are not, and a few corner cases
+with altered semantics.
+
+
+Yield inside comprehensions
+---------------------------
+
+As of Python 3.7, the outermost iterable in a comprehension is permitted to
+contain a 'yield' expression. If this is required, the iterable (or at least
+the yield) must be explicitly elevated from the comprehension::
+
+    # Python 3.7
+    def g():
+        return [x for x in [(yield 1)]]
+    # With PEP 572
+    def g():
+        sent_item = (yield 1)
+        return [x for x in [sent_item]]
+
+This more clearly shows that it is g(), not the comprehension, which is able
+to yield values (and is thus a generator function). The entire comprehension
+is consistently in a single scope.
+
+
+Name lookups in class scope
+---------------------------
+
+A comprehension inside a class previously was able to 'see' class members ONLY
+from the outermost iterable. Other name lookups would ignore the class and
+potentially locate a name at an outer scope::
+
+    pattern = "<%d>"
+    class X:
+        pattern = "[%d]"
+        numbers = [pattern % n for n in range(5)]
+
+In Python 3.7, ``X.numbers`` would show angle brackets; with PEP 572, it would
+show square brackets. Maintaining the current behaviour here is best done by
+using distinct names for the different forms of ``pattern``, as would be the
+case with functions.
+
+
+Generator expression bugs can be caught later
+---------------------------------------------
+
+Certain types of bugs in genexps were previously caught more quickly. Some are
+now detected only at first iteration::
+
+    gen = (x for x in rage(10)) # NameError
+    gen = (x for x in 10) # TypeError (not iterable)
+    gen = (x for x in range(1/0)) # Exception raised during evaluation
+
+This brings such generator expressions in line with a simple translation to
+function form::
+
+    def <genexp>():
+        for x in rage(10):
+            yield x
+    gen = <genexp>() # No exception yet
+    tng = next(gen) # NameError
+
+To detect these errors more quickly, ... TODO.
+
+
+Open questions
+==============
+
+Can the outermost iterable still be evaluated early?
+----------------------------------------------------
+
+As of Python 3.7, the outermost iterable in a genexp is evaluated early, and
+the result passed to the implicit function as an argument.  With PEP 572, this
+would no longer be the case. Can we still, somehow, evaluate it before moving
+on? One possible implementation would be::
+
+    gen = (x for x in rage(10))
+    # translates to
+    def <genexp>():
+        iterable = iter(rage(10))
+        yield None
+        for x in iterable:
+            yield x
+    gen = <genexp>()
+    next(gen)
+
+This would pump the iterable up to just before the loop starts, evaluating
+exactly as much as is evaluated outside the generator function in Py3.7.
+This would result in it being possible to call ``gen.send()`` immediately,
+unlike with most generators, and may incur unnecessary overhead in the
+common case where the iterable is pumped immediately (perhaps as part of a
+larger expression).
+
+
+Importing names into comprehensions
+-----------------------------------
+
+A list comprehension can use and update local names, and they will retain
+their values from one iteration to another. It would be convenient to use
+this feature to create rolling or self-effecting data streams::
+
+    progressive_sums = [total := total + value for value in data]
+
+This will fail with UnboundLocalError due to ``total`` not being initalized.
+Simply initializing it outside of the comprehension is insufficient - unless
+the comprehension is in class scope::
+
+    class X:
+        total = 0
+        progressive_sums = [total := total + value for value in data]
+
+At other scopes, it may be beneficial to have a way to fetch a value from the
+surrounding scope. Should this be automatic? Should it be controlled with a
+keyword? Hypothetically (and using no new keywords), this could be written::
+
+    total = 0
+    progressive_sums = [total := total + value
+        import nonlocal total
+        for value in data]
+
+Translated into longhand, this would become::
+
+    total = 0
+    def <listcomp>(total=total):
+        result = []
+        for value in data:
+            result.append(total := total + value)
+        return result
+    progressive_sums = <listcomp>()
+
+ie utilizing the same early-binding technique that is used at class scope.
+
+
+Operator precedence
+-------------------
+
+There are two logical precedences for the ``:=`` operator. Either it should
+bind as loosely as possible, as does statement-assignment; or it should bind
+more tightly than comparison operators. Placing its precedence between the
+comparison and arithmetic operators (to be precise: just lower than bitwise
+OR) allows most uses inside ``while`` and ``if`` conditions to be spelled
+without parentheses, as it is most likely that you wish to capture the value
+of something, then perform a comparison on it::
+
+    pos = -1
+    while pos := buffer.find(search_term, pos + 1) >= 0:
+        ...
+
+Once find() returns -1, the loop terminates. If ``:=`` binds as loosely as
+``=`` does, this would capture the result of the comparison (generally either
+``True`` or ``False``), which is less useful.
+
+
 Frequently Raised Objections
 ============================
 
@@ -309,6 +574,49 @@ inside a larger expression; the ``=`` operator can be chained more
 conveniently, and closely parallels the inline operations ``+=`` and friends.
 The assignment statement is a clear declaration of intent: this value is to
 be assigned to this target, and that's it.
+
+
+Why not use a sublocal scope and prevent namespace pollution?
+-------------------------------------------------------------
+
+Previous revisions of this proposal involved sublocal scope (restricted to a
+single statement), preventing name leakage and namespace pollution.  While a
+definite advantage in a number of situations, this increases complexity in
+many others, and the costs are not justified by the benefits. In the interests
+of language simplicity, the name bindings created here are exactly equivalent
+to any other name bindings, including that usage at class or module scope will
+create externally-visible names.  This is no different from ``for`` loops or
+other constructs, and can be solved the same way: ``del`` the name once it is
+no longer needed, or prefix it with an underscore.
+
+Names bound within a comprehension are local to that comprehension, even in
+the outermost iterable, and can thus be used freely without polluting the
+surrounding namespace.
+
+
+Style guide recommendations
+===========================
+
+As this adds another way to spell some of the same effects as can already be
+done, it is worth noting a few broad recommendations. These could be included
+in PEP 8 and/or other style guides.
+
+1. If either assignment statements or assignment expressions can be
+   used, prefer statements; they are a clear declaration of intent.
+
+2. If using assignment expressions would lead to ambiguity about
+   execution order, restructure it to use statements instead.
+
+3. Chaining multiple assignment expressions should generally be avoided.
+   More than one assignment per expression can detract from readability.
+
+
+Acknowledgements
+================
+
+The author wishes to thank Guido van Rossum and Nick Coghlan for their
+considerable contributions to this proposal, and to members of the
+core-mentorship mailing list for assistance with implementation.
 
 
 References
